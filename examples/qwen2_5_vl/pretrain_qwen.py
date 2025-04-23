@@ -464,19 +464,20 @@ def forward_step(data_iterator, model: Qwen2_5VLModel):
     vision_data = torch.cat([imgs, videos], dim=0)
     vision_grid = torch.cat([image_thw_grids, video_thw_grids], dim=0)
 
-    output_tensor = model(
+    output_tensor, new_loss_mask = model(
         input_ids = tokens,
         position_ids = position_ids,
         vision_data = vision_data,
         vision_grid_thw =  vision_grid,
         video_start_index = image_input_mask.sum().cpu().item(),
+        loss_mask = loss_mask,
         image_input_mask = image_input_mask,
         video_input_mask = video_input_mask,
         attention_mask = attention_mask,
         labels = labels
     )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, new_loss_mask)
 
 def run_online_eval(model):
     """Run an evaluation benchmark during training."""

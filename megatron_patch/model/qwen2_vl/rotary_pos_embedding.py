@@ -128,7 +128,7 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         emb = emb[..., None, :].transpose(0, 1).contiguous()
         if parallel_state.get_context_parallel_world_size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 1)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0)
         return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
