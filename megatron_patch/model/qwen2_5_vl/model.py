@@ -16,6 +16,43 @@ from .visionmodel import Qwen2_5VisionModel
 from .utils import get_batch_on_this_cp_rank
 from megatron_patch.model.qwen2_vl.gpt_model import GPTModel
 
+
+def print_current_rank(point:str):
+    dp_rank = parallel_state.get_data_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    print(f"{point}-dp_rank: {dp_rank}, tp_rank: {tp_rank}, cp_rank: {cp_rank}")
+
+class AllGatherVisionEmbeddings(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, seqlens_on_cp_ranks):
+        outputs = []
+        for i in range(len(seqlens_on_cp_ranks)):
+            o =torch.zeros((seqlens_on_cp_ranks[i].sum(), *input.shape[1:]), 
+                                       device=input.device, 
+                                       dtype=input.dtype, 
+                                       layout=input.layout)
+            outputs.append(o)
+        torch.distributed.all_gather(outputs, input, group=parallel_state.get_context_parallel_group())
+        cp_rank = parallel_state.get_context_parallel_rank()
+        ctx.cp_rank = cp_rank
+        # ctx.seqlens_on_cp_ranks = seqlens_on_cp_ranks
+        ctx.save_for_backward(*seqlens_on_cp_ranks)
+
+        output = torch.cat(outputs, dim=0)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        cp_rank = ctx.cp_rank
+        seqlens_on_cp_ranks = ctx.saved_tensors
+        # seqlens_on_cp_ranks = ctx.seqlens_on_cp_ranks
+        start_idx = torch.cat(seqlens_on_cp_ranks[:cp_rank]).sum() if cp_rank != 0 else 0
+        end_idx = start_idx + seqlens_on_cp_ranks[cp_rank].sum()
+        grad_output = grad_output[start_idx:end_idx]
+        return grad_output, None
+
+
 # Note: This is under development and may be missing features.
 class Qwen2_5VLModel(MegatronModule):
     """Qwen2.5VL multi-modal model.
@@ -169,6 +206,40 @@ class Qwen2_5VLModel(MegatronModule):
             for param in module.parameters():
                 param.requires_grad = False
 
+    def _get_vision_cp_data(self, vision_data, vision_grid_thw):
+        """Get vision data and grid_thw for context parallelism.
+        
+        Returns:
+            vision_data (torch.Tensor): Vision data of shape [total_thw_size, n_features].
+            vision_grid_thw (torch.Tensor): Vision grid_thw of shape [total_thw_size, 3].
+            seqlens_list (list of torch.Tensor): List of seqlens of the vision data in each context parallel rank, for the all gather after vision encoder.
+        """
+        # we use the context parallelism size and context parallel group of LLM for vision model.
+        # we only divide the number of images in each context parallel rank.
+        cp_size = self.language_model.config.context_parallel_size
+        cp_rank = parallel_state.get_context_parallel_rank()
+        if cp_size == 1 or not getattr(self.vision_model.config, 'enable_context_parallelism', False):
+            return vision_data, vision_grid_thw, None
+
+        img_num = vision_grid_thw.shape[0]
+        img_num_per_rank = (img_num + cp_size - 1) // cp_size
+        seqlens = torch.repeat_interleave(vision_grid_thw[:, 1] * vision_grid_thw[:, 2], vision_grid_thw[:, 0])
+        vision_grid_thw_list = []
+        vision_data_list = []
+        seqlens_list = []
+        for i in range(cp_size):
+            start_idx = i * img_num_per_rank
+            end_idx = min(start_idx + img_num_per_rank, img_num)
+            vision_grid_thw_list.append(vision_grid_thw[start_idx:end_idx])
+            seqlens_list.append(seqlens[start_idx:end_idx])
+            data_start_idx = seqlens[:start_idx].sum()
+            data_end_idx = seqlens[:end_idx].sum()
+            vision_data_list.append(vision_data[data_start_idx:data_end_idx])
+        new_vision_grid_thw = vision_grid_thw_list[cp_rank]
+        new_vision_data = vision_data_list[cp_rank]
+        new_seqlens_list = [t // self.square_merge_size for t in seqlens_list]
+        return new_vision_data, new_vision_grid_thw, new_seqlens_list
+
     def _process_embedding_token_parallel(
         self, combined_embeddings, labels, loss_mask, packed_seq_params
     ):
@@ -290,12 +361,27 @@ class Qwen2_5VLModel(MegatronModule):
         
         if self.pre_process:
             vision_embeds = None
+            original_vision_grid_thw = vision_grid_thw.clone()
+            vision_data, vision_grid_thw, seqlen_on_cp_ranks  = self._get_vision_cp_data(vision_data, vision_grid_thw)
+
             if vision_grid_thw.shape[0] > 0:
                 vision_embeds = self.vision_model(
                     vision_data=vision_data, # If None, vision model should use intermediate outputs (EPP > 1)
                     grid_thw=vision_grid_thw # should provided in each EPP stage
                 )
-                # print(f"vision_embeds.shape: {vision_embeds.shape}")
+
+            if original_vision_grid_thw.shape[0] > 0 and self.language_model.config.context_parallel_size > 1 \
+                and getattr(self.vision_model.config, 'enable_context_parallelism', False):
+                if vision_embeds is None:
+                    dtype = torch.float32
+                    if self.vision_model.config.bf16:
+                        dtype = torch.bfloat16
+                    elif self.vision_model.config.fp16:
+                        dtype = torch.float16
+                    else:
+                        print(f"WARN: vision model dtype is not bfloat16 or fp16, using float32")
+                    vision_embeds = torch.zeros((0, self.language_model.config.hidden_size), device=vision_data.device, dtype=dtype)
+                vision_embeds = AllGatherVisionEmbeddings.apply(vision_embeds, seqlen_on_cp_ranks)
 
             # If running inference, the language model KV cache will be updated for image token positions.
             # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.

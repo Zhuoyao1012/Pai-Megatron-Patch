@@ -84,6 +84,8 @@ def model_provider(
     vision_config = get_vision_model_config(args, deepcopy(config))
     vision_config.pipeline_model_parallel_size = 1
     vision_config.first_pipeline_num_layers = None
+    if args.enable_vision_context_parallelism:
+        vision_config.enable_context_parallelism = True
     vision_projector_config = get_vision_projection_config(deepcopy(config), vision_config.hidden_size, args.spatial_merge_size)
     
     print_rank_0("building Qwen2-5-VL model in TE...")
@@ -373,8 +375,8 @@ def get_batch(data_iterator):
     second_per_grid_ts = broadcast_data(['second_per_grid_ts'], data, torch.float32)['second_per_grid_ts']
 
 
-    image_input_mask = broadcast_data(["image_input_mask"], data, torch.bool)["image_input_mask"]
-    video_input_mask = broadcast_data(["video_input_mask"], data, torch.bool)["video_input_mask"]
+    image_input_mask = broadcast_data(["image_input_mask"], data, torch.bool)["image_input_mask"] ## position mask for image in vlm input sequence
+    video_input_mask = broadcast_data(["video_input_mask"], data, torch.bool)["video_input_mask"] ## position mask for video in vlm input sequence
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("index tokens")
@@ -463,6 +465,19 @@ def forward_step(data_iterator, model: Qwen2_5VLModel):
 
     vision_data = torch.cat([imgs, videos], dim=0)
     vision_grid = torch.cat([image_thw_grids, video_thw_grids], dim=0)
+    # print_rank_0(f"tokens: {tokens.shape if tokens is not None else None}, \n \
+    #       labels: {labels.shape if labels is not None else None}, \n \
+    #       loss_mask: {loss_mask.shape if loss_mask is not None else None}, \n \
+    #       attention_mask: {attention_mask.shape if attention_mask is not None else None}, \n \
+    #       position_ids: {position_ids.shape if position_ids is not None else None}, \n \
+    #       imgs: {imgs.shape if imgs is not None else None}, \n \
+    #       videos: {videos.shape if videos is not None else None}, \n \
+    #       image_thw_grids: {image_thw_grids.shape if image_thw_grids is not None else None}, \n \
+    #       video_thw_grids: {video_thw_grids.shape if video_thw_grids is not None else None}, \n \
+    #       image_input_mask: {image_input_mask.shape if image_input_mask is not None else None}, \n \
+    #       video_input_mask: {video_input_mask.shape if video_input_mask is not None else None}")
+    # print_rank_0(f"vision_data: {vision_data.shape if vision_data is not None else None}, \n \
+    #       vision_grid: {vision_grid.shape if vision_grid is not None else None}")
 
     output_tensor, new_loss_mask = model(
         input_ids = tokens,

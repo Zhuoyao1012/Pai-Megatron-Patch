@@ -564,4 +564,6 @@ def get_patch_args(parser):
         help="Surround image tokens with tags.",
     )
 
+    group.add_argument('--enable-vision-context-parallelism', action='store_true', default=False)
+
     return parser
