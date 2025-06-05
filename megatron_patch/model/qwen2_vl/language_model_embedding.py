@@ -20,6 +20,8 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.packed_seq_params import PackedSeqParams
+from .context_parallel import get_batch_on_this_cp_rank
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -94,6 +96,63 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
 
+    def _process_embedding_token_parallel(
+        self, combined_embeddings, packed_seq_params
+    ):
+        """Processes the input data for model parallelism support.
+
+        When using sequence parallelism (SP) or context parallelism (CP), the sequence is sharded
+        across different GPUs. This function performs the sharding and distributes the sequence
+        across GPUs for SP and CP
+
+        Context Parallelism is a feature that helps improve memory efficiency for
+        long sequence training by distributing sequence across CP ranks.
+        It requires token length to be divisible by (CP size *2) to ensure proper load balance.
+
+        Sequence Parallelism is a feature that helps improve memory efficiency for
+        long sequence training by distributing sequence across TP ranks.
+        It requires token length to be divisible by TP size.
+
+        Returns:
+            combined_embeddings (torch.Tensor): image and text embeddings combined and distributed. [S, B, H]
+
+        """
+
+        shard_factor = seq_dim = None
+        if self.config.context_parallel_size > 1 and self.config.sequence_parallel:
+            shard_factor = self.config.tensor_model_parallel_size * self.config.context_parallel_size * 2
+            # seq_dim = 1
+        elif self.config.context_parallel_size > 1:
+            shard_factor = self.config.context_parallel_size * 2
+            # seq_dim = 1
+        elif self.config.sequence_parallel:
+            shard_factor = self.config.tensor_model_parallel_size
+            # seq_dim = 0
+
+        seq_dim = 0
+        assert (
+            combined_embeddings.shape[seq_dim] % shard_factor == 0
+        ), f"Sequence length should be divisible by {shard_factor} for \
+            Sequence/Context parallelism"
+        if self.config.sequence_parallel and self.config.tp_comm_overlap_lm:
+            assert (
+                combined_embeddings.shape[seq_dim] == self.config.max_sequence_length
+            ), f"TP Comm overlap either requires Vision+Text token length \
+            == language_max_sequence_length"
+
+        if self.config.context_parallel_size > 1:
+            batch = dict()
+            batch["combined_embeddings"] = combined_embeddings
+            # Distribute sequence across CP ranks
+            if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
+                batch = get_batch_on_this_cp_rank(batch)
+            else:
+                raise NotImplementedError("THD format data is not supported yet")
+
+            combined_embeddings = batch["combined_embeddings"]  # [S/CP, B, H]
+
+        return combined_embeddings
+
     def forward(
         self, 
         input_ids: Tensor, 
@@ -102,7 +161,8 @@ class LanguageModelEmbedding(MegatronModule):
         image_input_mask: Tensor = None,
         video_input_mask: Tensor = None,
         image_embeds: Tensor = None,
-        video_embeds: Tensor = None
+        video_embeds: Tensor = None, 
+        packed_seq_params: PackedSeqParams = None,
     ) -> Tensor:
         """Forward pass of the embedding module.
 
@@ -145,6 +205,8 @@ class LanguageModelEmbedding(MegatronModule):
                     embeddings[image_input_mask] = image_embeds.to(embeddings.device, embeddings.dtype)
                 if video_embeds is not None:
                     embeddings[video_input_mask] = video_embeds.to(embeddings.device, embeddings.dtype)
+
+                embeddings = self._process_embedding_token_parallel(embeddings, packed_seq_params)
                 embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
@@ -159,6 +221,7 @@ class LanguageModelEmbedding(MegatronModule):
                 embeddings[image_input_mask] = image_embeds.to(embeddings.device, embeddings.dtype)
             if video_embeds is not None:
                 embeddings[video_input_mask] = video_embeds.to(embeddings.device, embeddings.dtype)
+            embeddings = self._process_embedding_token_parallel(embeddings, packed_seq_params)
             embeddings = self.embedding_dropout(embeddings)
 
         return embeddings

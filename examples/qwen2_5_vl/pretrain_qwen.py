@@ -422,8 +422,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     loss_mask = loss_mask.view(-1).float()
 
     loss = torch.stack([torch.sum(losses.view(-1) * loss_mask), loss_mask.sum()])
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+    # We don't need to all_reduce here, because the logits are already all_gathered in the model forward pass
+    # if args.context_parallel_size > 1:
+    #     torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+    #     print(f"loss after all_reduce: {loss}, cp_rank: {parallel_state.get_context_parallel_rank()}")
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     if args.check_for_nan_in_loss_and_grad:

@@ -13,8 +13,8 @@ from .transformer_config import Qwen2VLTransformerConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .visionmodel import Qwen2_5VisionModel
-from .utils import get_batch_on_this_cp_rank
 from megatron_patch.model.qwen2_vl.gpt_model import GPTModel
+from megatron_patch.model.qwen2_vl.context_parallel import AllGatherVisionEmbeddings
 
 
 def print_current_rank(point:str):
@@ -23,34 +23,6 @@ def print_current_rank(point:str):
     cp_rank = parallel_state.get_context_parallel_rank()
     print(f"{point}-dp_rank: {dp_rank}, tp_rank: {tp_rank}, cp_rank: {cp_rank}")
 
-class AllGatherVisionEmbeddings(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, seqlens_on_cp_ranks):
-        outputs = []
-        for i in range(len(seqlens_on_cp_ranks)):
-            o =torch.zeros((seqlens_on_cp_ranks[i].sum(), *input.shape[1:]), 
-                                       device=input.device, 
-                                       dtype=input.dtype, 
-                                       layout=input.layout)
-            outputs.append(o)
-        torch.distributed.all_gather(outputs, input, group=parallel_state.get_context_parallel_group())
-        cp_rank = parallel_state.get_context_parallel_rank()
-        ctx.cp_rank = cp_rank
-        # ctx.seqlens_on_cp_ranks = seqlens_on_cp_ranks
-        ctx.save_for_backward(*seqlens_on_cp_ranks)
-
-        output = torch.cat(outputs, dim=0)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        cp_rank = ctx.cp_rank
-        seqlens_on_cp_ranks = ctx.saved_tensors
-        # seqlens_on_cp_ranks = ctx.seqlens_on_cp_ranks
-        start_idx = torch.cat(seqlens_on_cp_ranks[:cp_rank]).sum() if cp_rank != 0 else 0
-        end_idx = start_idx + seqlens_on_cp_ranks[cp_rank].sum()
-        grad_output = grad_output[start_idx:end_idx]
-        return grad_output, None
 
 
 # Note: This is under development and may be missing features.
@@ -240,83 +212,7 @@ class Qwen2_5VLModel(MegatronModule):
         new_seqlens_list = [t // self.square_merge_size for t in seqlens_list]
         return new_vision_data, new_vision_grid_thw, new_seqlens_list
 
-    def _process_embedding_token_parallel(
-        self, combined_embeddings, labels, loss_mask, packed_seq_params
-    ):
-        """Processes the input data for model parallelism support.
 
-        When using sequence parallelism (SP) or context parallelism (CP), the sequence is sharded
-        across different GPUs. This function performs the sharding and distributes the sequence
-        across GPUs for SP and CP
-
-        Context Parallelism is a feature that helps improve memory efficiency for
-        long sequence training by distributing sequence across CP ranks.
-        It requires token length to be divisible by (CP size *2) to ensure proper load balance.
-
-        Sequence Parallelism is a feature that helps improve memory efficiency for
-        long sequence training by distributing sequence across TP ranks.
-        It requires token length to be divisible by TP size.
-
-        Returns:
-            combined_embeddings (torch.Tensor): image and text embeddings combined and distributed. [S, B, H]
-            new_labels (torch.Tensor): Distributed labels for image and text positions. [S, B]
-            packed_seq_params (PackedSeqParams): Dict with padded token information.
-
-        """
-
-        # No pre or post processing needed with PP middle chunks.
-        if not self.pre_process and not self.post_process:
-            return combined_embeddings, labels, loss_mask, packed_seq_params
-
-        shard_factor = seq_dim = None
-        if self.pre_process:
-            if self.context_parallel_lm > 1 and self.sequence_parallel_lm:
-                shard_factor = self.tensor_model_parallel_size_lm * self.context_parallel_lm * 2
-                # seq_dim = 1
-            elif self.context_parallel_lm > 1:
-                shard_factor = self.context_parallel_lm * 2
-                # seq_dim = 1
-            elif self.sequence_parallel_lm:
-                shard_factor = self.tensor_model_parallel_size_lm
-                # seq_dim = 0
-
-            seq_dim = 0
-            assert (
-                combined_embeddings.shape[seq_dim] % shard_factor == 0
-            ), f"Sequence length should be divisible by {shard_factor} for \
-                Sequence/Context parallelism"
-            if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
-                assert (
-                    combined_embeddings.shape[seq_dim] == self._language_max_sequence_length
-                ), f"TP Comm overlap either requires Vision+Text token length \
-                == language_max_sequence_length"
-
-        if self.context_parallel_lm > 1:
-            batch = dict()
-            if self.pre_process:
-                batch["combined_embeddings"] = combined_embeddings
-            if self.post_process:
-                batch["labels"] = labels
-                batch["loss_mask"] = loss_mask
-            # Distribute sequence across CP ranks
-            if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
-                batch = get_batch_on_this_cp_rank(batch)
-            else:
-                raise NotImplementedError("THD format data is not supported yet")
-
-            if self.pre_process:
-                combined_embeddings = batch["combined_embeddings"]  # [S/CP, B, H]
-
-            if self.post_process:
-                new_labels = batch["labels"]
-                new_loss_mask = batch["loss_mask"]
-
-        if self.sequence_parallel_lm and self.pre_process:
-            combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
-                combined_embeddings
-            )  # [S/(CP*TP),B,H]
-
-        return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
 
     def forward(
         self,
@@ -390,7 +286,6 @@ class Qwen2_5VLModel(MegatronModule):
                 # inference_params.key_value_memory_dict["image_tokens_count"] = (
                 #     vision_embeddings.shape[0]
                 # )
-            
             # If running inference, we can skip image token computation if they were computed already earlier for this sample.
             if use_inference_kv_cache:
                 language_embeddings: torch.Tensor = self.language_model.embedding(
@@ -424,20 +319,22 @@ class Qwen2_5VLModel(MegatronModule):
                     image_input_mask=image_input_mask,
                     video_input_mask=video_input_mask,
                     image_embeds=image_embeds,
-                    video_embeds=video_embeds
+                    video_embeds=video_embeds,
+                    packed_seq_params=packed_seq_params
                 )  # [text_seq_len, b, h_language]
             else:
                 combined_embeddings = self.language_model.embedding(
                     input_ids=input_ids,
-                    position_ids=None # NOTE: disable
+                    position_ids=None, # NOTE: disable
+                    packed_seq_params=packed_seq_params
                 )  # [text_seq_len, b, h_language]
         else:
             combined_embeddings = None
         
-        if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
-            combined_embeddings, labels, loss_mask, packed_seq_params = self._process_embedding_token_parallel(
-                combined_embeddings, labels, loss_mask, packed_seq_params
-            )
+        # if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
+        #     combined_embeddings, labels, loss_mask, packed_seq_params = self._process_embedding_token_parallel(
+        #         combined_embeddings, labels, loss_mask, packed_seq_params
+        #     )
 
         # print(f"combined_embeddings.shape: {combined_embeddings.shape}")
         # print(f"attention_mask: {attention_mask}")

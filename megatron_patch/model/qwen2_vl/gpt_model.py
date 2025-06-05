@@ -16,6 +16,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from .context_parallel import AllGatherLanguageEmbeddings
+
 
 from .rotary_pos_embedding import Qwen2VLRotaryEmbedding
 
@@ -199,6 +201,8 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
+        if self.config.context_parallel_size > 1:
+            hidden_states = AllGatherLanguageEmbeddings.apply(hidden_states, packed_seq_params)
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
