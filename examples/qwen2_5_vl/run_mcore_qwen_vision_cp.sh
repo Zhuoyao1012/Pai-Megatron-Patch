@@ -73,6 +73,7 @@ LR_WARMUP_ITERS=${23}
 OUTPUT_BASEPATH=${24}
 ### OTHERS ###
 if [ $FL = true ]; then
+    echo "Note: if you want to enable THD CP for LLM, you must disable flash attention and use fused attention."
     export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0
 elif [ $FL = false ]; then
     export NVTE_FLASH_ATTN=0 NVTE_FUSED_ATTN=1
@@ -270,10 +271,11 @@ elif [ $PROFILE = false ]; then
 fi
 
 WANDB=true
+# WANDB=false
 if [ $WANDB = true ]; then
     wandb_options=" \
     --wandb-project qwen2_5_vl \
-    --wandb-exp-name qwen2_5_vl_${MODEL_SIZE}_${PR}_tp${TP}_pp${PP}_vcp+lmcp${CP}_ac${AC}_do${DO}_sp${SP}_ti${TRAIN_ITERS}_wi${LR_WARMUP_ITERS} \
+    --wandb-exp-name qwen2_5_vl_${MODEL_SIZE}_${PR}_tp${TP}_pp${PP}_vcp+lmcp${CP}_ac${AC}_do${DO}_sp${SP}_ti${TRAIN_ITERS}_wi${LR_WARMUP_ITERS}_cp_thd \
     --wandb-save-dir ${OUTPUT_BASEPATH}/wandb/ \
 "
 elif [ $WANDB = false ]; then
@@ -341,6 +343,7 @@ megatron_options="  \
         --transformer-impl transformer_engine \
         --ckpt-format torch \
         --enable-vision-context-parallelism \
+        --enable-language-model-thd-format \
         ${profile_options}
         ${wandb_options}
         "

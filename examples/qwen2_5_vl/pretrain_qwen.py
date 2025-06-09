@@ -20,6 +20,7 @@ from typing import Union, Optional, Tuple
 
 import torch
 import torch._dynamo
+from torch.nn.functional import pad
 from megatron.core import mpu
 
 from megatron.core import parallel_state
@@ -51,8 +52,11 @@ from megatron_patch.model.qwen2_5_vl.transformer_config import (
     get_vision_projection_config
 )
 from megatron.core import mpu, tensor_parallel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron_patch.data.dataset_helpers import TaskEncoder, print_error_handler
+from megatron_patch.model.qwen2_vl.context_parallel import sbhd_to_thd_format
+
 
 from megatron.energon import (
     LimitDataset,
@@ -63,6 +67,32 @@ from megatron.energon import (
     get_train_dataset,
     get_val_datasets,
 )
+
+def get_packed_seq_params(attention_mask):
+    args = get_args()
+    seqlen = attention_mask.sum(dim=-1)
+    cp_world_size = parallel_state.get_context_parallel_world_size()
+    shard_factor = 1
+    if cp_world_size > 1:
+        shard_factor = 2 * cp_world_size
+    if args.sequence_parallel:
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        shard_factor *= tp_size
+    
+    seqlen_padded = (seqlen + shard_factor - 1) // shard_factor * shard_factor
+    
+    cu_seqlens = pad(seqlen.cumsum(dim=0).int(), (1, 0), value=0)
+    cu_seqlens_padded = pad(seqlen_padded.cumsum(dim=0).int(), (1, 0), value=0)
+
+    return PackedSeqParams(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=seqlen_padded.max(),
+        max_seqlen_kv=seqlen_padded.max(),
+        qkv_format='thd',
+    )
 
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True
@@ -223,6 +253,7 @@ def get_rope_index(
             vision_tokens = input_ids[vision_start_indices + 1]
             image_nums = (vision_tokens == image_token_id).sum()
             video_nums = (vision_tokens == video_token_id).sum()
+            # print(f"image_nums: {image_nums}, video_nums: {video_nums}, text_nums: {attention_mask[i].sum() - image_nums - video_nums}")
             input_tokens = input_ids.tolist()
             llm_pos_ids_list: list = []
             st = 0
@@ -395,6 +426,12 @@ def get_batch(data_iterator):
     )
     torch.cuda.nvtx.range_pop()
 
+    packed_seq_params = None
+    args = get_args()
+    if args.enable_language_model_thd_format:
+        # calcuate the attention mask with tokens and pad token id
+        packed_seq_params = get_packed_seq_params(tokens != tokenizer.pad_token_id)
+
     return (
         tokens, 
         labels, 
@@ -406,7 +443,8 @@ def get_batch(data_iterator):
         image_thw_grids, 
         video_thw_grids,
         image_input_mask, 
-        video_input_mask
+        video_input_mask, 
+        packed_seq_params
     )
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
@@ -461,25 +499,32 @@ def forward_step(data_iterator, model: Qwen2_5VLModel):
         image_thw_grids, 
         video_thw_grids,
         image_input_mask, 
-        video_input_mask
+        video_input_mask, 
+        packed_seq_params
     ) = get_batch(data_iterator)
     timers("batch-generator").stop()
 
     vision_data = torch.cat([imgs, videos], dim=0)
     vision_grid = torch.cat([image_thw_grids, video_thw_grids], dim=0)
-    # print_rank_0(f"tokens: {tokens.shape if tokens is not None else None}, \n \
-    #       labels: {labels.shape if labels is not None else None}, \n \
-    #       loss_mask: {loss_mask.shape if loss_mask is not None else None}, \n \
-    #       attention_mask: {attention_mask.shape if attention_mask is not None else None}, \n \
-    #       position_ids: {position_ids.shape if position_ids is not None else None}, \n \
-    #       imgs: {imgs.shape if imgs is not None else None}, \n \
-    #       videos: {videos.shape if videos is not None else None}, \n \
-    #       image_thw_grids: {image_thw_grids.shape if image_thw_grids is not None else None}, \n \
-    #       video_thw_grids: {video_thw_grids.shape if video_thw_grids is not None else None}, \n \
-    #       image_input_mask: {image_input_mask.shape if image_input_mask is not None else None}, \n \
-    #       video_input_mask: {video_input_mask.shape if video_input_mask is not None else None}")
-    # print_rank_0(f"vision_data: {vision_data.shape if vision_data is not None else None}, \n \
-    #       vision_grid: {vision_grid.shape if vision_grid is not None else None}")
+    # print_rank_0(
+        # f"tokens: {tokens.shape if tokens is not None else None}, \n"
+        # f"labels: {labels.shape if labels is not None else None}, \n"
+        # f"loss_mask: {loss_mask.shape if loss_mask is not None else None}, \n"
+        # f"attention_mask: {attention_mask.shape if attention_mask is not None else None}, \n"
+        # f"position_ids: {position_ids.shape if position_ids is not None else None}, \n"
+        # f"imgs: {imgs.shape if imgs is not None else None}, \n"
+        # f"videos: {videos.shape if videos is not None else None}, \n"
+        # f"image_thw_grids: {image_thw_grids.shape if image_thw_grids is not None else None}, \n"
+        # f"video_thw_grids: {video_thw_grids.shape if video_thw_grids is not None else None}, \n"
+        # f"image_input_mask: {image_input_mask.shape if image_input_mask is not None else None}, \n"
+        # f"video_input_mask: {video_input_mask.shape if video_input_mask is not None else None}, \n"
+        # f"vision_data: {vision_data.shape if vision_data is not None else None}, \n"
+        # f"vision_grid: {vision_grid.shape if vision_grid is not None else None}"
+        # )
+
+    if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        tokenizer = get_tokenizer()
+        tokens, position_ids, image_input_mask, video_input_mask = sbhd_to_thd_format(tokens, position_ids, image_input_mask, video_input_mask, packed_seq_params, pad_token_id=tokenizer.pad_token_id)
 
     output_tensor, new_loss_mask = model(
         input_ids = tokens,
@@ -491,7 +536,8 @@ def forward_step(data_iterator, model: Qwen2_5VLModel):
         image_input_mask = image_input_mask,
         video_input_mask = video_input_mask,
         attention_mask = attention_mask,
-        labels = labels
+        labels = labels,
+        packed_seq_params = packed_seq_params
     )
 
     return output_tensor, partial(loss_func, new_loss_mask)

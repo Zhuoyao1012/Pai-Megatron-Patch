@@ -565,5 +565,6 @@ def get_patch_args(parser):
     )
 
     group.add_argument('--enable-vision-context-parallelism', action='store_true', default=False)
+    group.add_argument('--enable-language-model-thd-format', action='store_true', default=False)
 
     return parser

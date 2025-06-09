@@ -21,7 +21,7 @@ from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.packed_seq_params import PackedSeqParams
-from .context_parallel import get_batch_on_this_cp_rank
+from .context_parallel import get_batch_on_this_cp_rank, get_embeddings_on_this_cp_rank_thd
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -141,15 +141,16 @@ class LanguageModelEmbedding(MegatronModule):
             == language_max_sequence_length"
 
         if self.config.context_parallel_size > 1:
-            batch = dict()
-            batch["combined_embeddings"] = combined_embeddings
             # Distribute sequence across CP ranks
             if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
+                batch = dict()
+                batch["combined_embeddings"] = combined_embeddings
                 batch = get_batch_on_this_cp_rank(batch)
+                combined_embeddings = batch["combined_embeddings"]  # [S/CP, B, H]
             else:
-                raise NotImplementedError("THD format data is not supported yet")
+                combined_embeddings = get_embeddings_on_this_cp_rank_thd.apply(combined_embeddings, packed_seq_params)
+                # raise NotImplementedError("THD format data is not supported yet")
 
-            combined_embeddings = batch["combined_embeddings"]  # [S/CP, B, H]
 
         return combined_embeddings
 

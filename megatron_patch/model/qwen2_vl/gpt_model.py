@@ -16,7 +16,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from .context_parallel import AllGatherLanguageEmbeddings
+from .context_parallel import AllGatherLanguageEmbeddings, thd_to_sbhd_format
 
 
 from .rotary_pos_embedding import Qwen2VLRotaryEmbedding
@@ -186,7 +186,7 @@ class GPTModel(LanguageModule):
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
-            rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
+            rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section, packed_seq_params)
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -201,17 +201,23 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.context_parallel_size > 1:
-            hidden_states = AllGatherLanguageEmbeddings.apply(hidden_states, packed_seq_params)
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
         logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
+        # to compatible with sequence parallel, we need to put cp allgather after the last output layer which will do sp allgather
+        if self.config.context_parallel_size > 1:
+            logits = AllGatherLanguageEmbeddings.apply(logits, packed_seq_params)
+
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            max_sbhd_pad_seqlen = labels.shape[1]
+            logits = thd_to_sbhd_format(logits, packed_seq_params, max_pad_seqlen=max_sbhd_pad_seqlen)
 
         loss = self.compute_language_model_loss(labels, logits)
 

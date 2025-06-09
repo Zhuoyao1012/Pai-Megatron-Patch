@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional, List
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
+    from megatron.core.packed_seq_params import PackedSeqParams
 
 import logging
 
@@ -37,6 +38,8 @@ try:
     HAVE_APPLY_ROPE_FUSION = True
 except:
     HAVE_APPLY_ROPE_FUSION = False
+
+from .context_parallel import get_pos_emb_on_this_cp_rank_thd
 
 
 __all__ = ['Qwen2VLRotaryEmbedding', 'apply_rotary_pos_emb']
@@ -90,7 +93,7 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             )
         )
 
-    def forward(self, position_ids: torch.Tensor, mrope_section: List[int]) -> Tensor:
+    def forward(self, position_ids: torch.Tensor, mrope_section: List[int], packed_seq_params: PackedSeqParams=None) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
         Args:
@@ -127,8 +130,11 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
         if parallel_state.get_context_parallel_world_size() > 1:
-            # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+            if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd': 
+                # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
+                emb = get_pos_emb_on_this_cp_rank(emb, 0)
+            elif packed_seq_params.qkv_format == 'thd':
+                emb = get_pos_emb_on_this_cp_rank_thd(emb, packed_seq_params)
         return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
